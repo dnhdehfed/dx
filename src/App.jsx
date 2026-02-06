@@ -10,6 +10,7 @@ function App() {
   const [response, setResponse] = useState('');
   const [permissionGranted, setPermissionGranted] = useState(false);
   const [conversationMode, setConversationMode] = useState(false);
+  const [debugLog, setDebugLog] = useState([]);
   
   const recognitionRef = useRef(null);
   const synthRef = useRef(window.speechSynthesis);
@@ -19,6 +20,12 @@ function App() {
     requestMicrophonePermission();
   }, []);
 
+  const addDebugLog = (message) => {
+    const timestamp = new Date().toLocaleTimeString();
+    setDebugLog(prev => [...prev.slice(-4), `[${timestamp}] ${message}`]);
+    console.log(message);
+  };
+
   const requestMicrophonePermission = async () => {
     try {
       setStatus('Requesting microphone permission...');
@@ -26,19 +33,29 @@ function App() {
       stream.getTracks().forEach(track => track.stop());
       setPermissionGranted(true);
       setStatus('Permission granted! Tap "Start Listening" to begin.');
+      addDebugLog('Microphone permission granted');
     } catch (error) {
       setStatus('Microphone permission denied. Please enable it in settings.');
       console.error('Permission error:', error);
+      addDebugLog('Permission denied: ' + error.message);
     }
   };
 
   const speak = (text) => {
     return new Promise((resolve) => {
+      // Cancel any ongoing speech
+      synthRef.current.cancel();
+      
       const utterance = new SpeechSynthesisUtterance(text);
-      utterance.rate = 1.0;
+      utterance.rate = 1.1;
       utterance.pitch = 1.0;
       utterance.volume = 1.0;
       utterance.onend = resolve;
+      utterance.onerror = (e) => {
+        console.error('Speech error:', e);
+        resolve();
+      };
+      
       synthRef.current.speak(utterance);
     });
   };
@@ -46,6 +63,7 @@ function App() {
   const callOpenRouter = async (userMessage) => {
     try {
       setStatus('Thinking...');
+      addDebugLog('Calling AI with: ' + userMessage);
       
       const response = await fetch('https://openrouter.ai/api/v1/chat/completions', {
         method: 'POST',
@@ -60,7 +78,7 @@ function App() {
           messages: [
             {
               role: 'system',
-              content: 'You are a helpful voice assistant. Keep responses concise and conversational, under 50 words.'
+              content: 'You are a helpful voice assistant. Keep responses very concise and conversational, under 40 words. Speak naturally like you are talking to someone.'
             },
             {
               role: 'user',
@@ -75,6 +93,7 @@ function App() {
       if (data.choices && data.choices[0] && data.choices[0].message) {
         const aiResponse = data.choices[0].message.content;
         setResponse(aiResponse);
+        addDebugLog('AI response: ' + aiResponse.substring(0, 50) + '...');
         setStatus('Speaking...');
         await speak(aiResponse);
         setStatus('Listening for "yo"...');
@@ -84,7 +103,8 @@ function App() {
       }
     } catch (error) {
       console.error('OpenRouter error:', error);
-      const errorMsg = 'Sorry, I had trouble connecting to my brain.';
+      addDebugLog('API error: ' + error.message);
+      const errorMsg = 'Sorry, I had trouble with that.';
       setResponse(errorMsg);
       await speak(errorMsg);
       setStatus('Listening for "yo"...');
@@ -109,67 +129,140 @@ function App() {
     recognition.continuous = true;
     recognition.interimResults = true;
     recognition.lang = 'en-US';
+    recognition.maxAlternatives = 1;
 
     recognition.onstart = () => {
       setIsListening(true);
       if (conversationMode) {
-        setStatus('Listening for your question...');
+        setStatus('🎤 Listening for your question...');
+        addDebugLog('Started listening for question');
       } else {
-        setStatus('Listening for "yo"...');
+        setStatus('👂 Listening for "yo"...');
+        addDebugLog('Started listening for wake word');
       }
     };
 
     recognition.onresult = async (event) => {
       const last = event.results.length - 1;
       const text = event.results[last][0].transcript.toLowerCase().trim();
-      setTranscript(text);
+      const confidence = event.results[last][0].confidence;
+      
+      // Show what we're hearing in real-time
+      if (!event.results[last].isFinal) {
+        setTranscript(`Hearing: ${text}...`);
+      }
 
       if (event.results[last].isFinal) {
-        if (!conversationMode && text.includes('yo')) {
-          setConversationMode(true);
-          setStatus('Speaking...');
-          recognition.stop();
-          await speak('Hi! What do you want?');
-          setStatus('Listening for your question...');
-          // Restart recognition in conversation mode
-          setTimeout(() => {
-            if (recognitionRef.current) {
-              recognitionRef.current.start();
+        addDebugLog(`Final: "${text}" (confidence: ${confidence?.toFixed(2)})`);
+        setTranscript(text);
+        
+        if (!conversationMode) {
+          // Wake word detection - be very flexible
+          const words = text.split(/\s+/);
+          const hasWakeWord = words.some(word => {
+            const clean = word.replace(/[^a-z]/g, '');
+            return clean === 'yo' || 
+                   clean === 'yeah' || 
+                   clean === 'hey' ||
+                   clean === 'yep' ||
+                   clean.startsWith('yo');
+          });
+          
+          // Also check if the whole phrase contains "yo" as a separate word
+          const containsYo = text.match(/\byo\b/);
+          
+          if (hasWakeWord || containsYo) {
+            addDebugLog('✓ Wake word detected!');
+            setConversationMode(true);
+            setStatus('✓ Activated! 🎤');
+            recognition.stop();
+            
+            // Brief pause
+            await new Promise(resolve => setTimeout(resolve, 400));
+            
+            setStatus('Speaking...');
+            await speak('Hi! What do you want?');
+            
+            // Clear and prepare for question
+            setTranscript('');
+            setStatus('🎤 Ask your question now...');
+            await new Promise(resolve => setTimeout(resolve, 1000));
+            
+            // Restart in conversation mode
+            if (recognitionRef.current && isListening) {
+              try {
+                recognitionRef.current.start();
+              } catch (e) {
+                addDebugLog('Restart failed: ' + e.message);
+              }
             }
-          }, 500);
-        } else if (conversationMode) {
-          recognition.stop();
-          await callOpenRouter(text);
-          setConversationMode(false);
-          // Restart recognition in wake word mode
-          setTimeout(() => {
-            if (recognitionRef.current) {
-              recognitionRef.current.start();
+          }
+        } else {
+          // In conversation mode - process the question
+          if (text.length > 2) { // Ignore very short utterances
+            addDebugLog('Processing question');
+            recognition.stop();
+            
+            await callOpenRouter(text);
+            
+            // Return to wake word mode
+            setTranscript('');
+            setConversationMode(false);
+            await new Promise(resolve => setTimeout(resolve, 1200));
+            
+            // Restart in wake word mode
+            if (recognitionRef.current && isListening) {
+              try {
+                recognitionRef.current.start();
+              } catch (e) {
+                addDebugLog('Restart failed: ' + e.message);
+              }
             }
-          }, 500);
+          }
         }
       }
     };
 
     recognition.onerror = (event) => {
       console.error('Recognition error:', event.error);
+      addDebugLog('Error: ' + event.error);
+      
       if (event.error === 'no-speech') {
+        // No speech detected - just continue
         recognition.stop();
         setTimeout(() => {
           if (recognitionRef.current && isListening) {
-            recognitionRef.current.start();
+            try {
+              recognitionRef.current.start();
+            } catch (e) {
+              addDebugLog('Auto-restart failed');
+            }
           }
         }, 1000);
+      } else if (event.error === 'aborted') {
+        // Normal - just restart
+        setTimeout(() => {
+          if (recognitionRef.current && isListening) {
+            try {
+              recognitionRef.current.start();
+            } catch (e) {
+              addDebugLog('Auto-restart failed');
+            }
+          }
+        }, 500);
       }
     };
 
     recognition.onend = () => {
+      addDebugLog('Recognition ended');
       if (isListening && recognitionRef.current) {
         setTimeout(() => {
           try {
-            recognitionRef.current.start();
+            if (recognitionRef.current && isListening) {
+              recognitionRef.current.start();
+            }
           } catch (e) {
-            console.log('Restart failed, will retry');
+            addDebugLog('Auto-restart failed: ' + e.message);
           }
         }, 1000);
       }
@@ -180,12 +273,14 @@ function App() {
   };
 
   const stopListening = () => {
+    addDebugLog('Stopping listening');
     setIsListening(false);
     setConversationMode(false);
     if (recognitionRef.current) {
       recognitionRef.current.stop();
       recognitionRef.current = null;
     }
+    synthRef.current.cancel();
     setStatus('Stopped');
   };
 
@@ -234,10 +329,18 @@ function App() {
           </div>
         )}
 
+        <div style={styles.debugBox}>
+          <p style={styles.debugLabel}>Debug Log:</p>
+          {debugLog.map((log, i) => (
+            <p key={i} style={styles.debugText}>{log}</p>
+          ))}
+        </div>
+
         <div style={styles.instructions}>
-          <p style={styles.instructionText}>📱 Say "yo" to activate</p>
-          <p style={styles.instructionText}>💬 Ask your question</p>
-          <p style={styles.instructionText}>🤖 Get AI-powered answers</p>
+          <p style={styles.instructionText}>📱 Say "yo" clearly to activate</p>
+          <p style={styles.instructionText}>💬 Wait for "Hi! What do you want?"</p>
+          <p style={styles.instructionText}>🗣️ Then ask your question</p>
+          <p style={styles.instructionText}>🔁 Returns to listening after answer</p>
         </div>
       </div>
     </div>
@@ -288,7 +391,8 @@ const styles = {
   status: {
     fontSize: '16px',
     color: '#374151',
-    margin: 0
+    margin: 0,
+    fontWeight: '500'
   },
   buttonContainer: {
     display: 'flex',
@@ -341,7 +445,29 @@ const styles = {
     backgroundColor: '#dbeafe',
     borderRadius: '12px',
     padding: '16px',
-    marginBottom: '20px'
+    marginBottom: '12px'
+  },
+  debugBox: {
+    backgroundColor: '#fef3c7',
+    borderRadius: '12px',
+    padding: '12px',
+    marginBottom: '20px',
+    maxHeight: '120px',
+    overflowY: 'auto',
+    fontSize: '11px'
+  },
+  debugLabel: {
+    fontSize: '10px',
+    fontWeight: '600',
+    color: '#92400e',
+    marginBottom: '4px',
+    textTransform: 'uppercase'
+  },
+  debugText: {
+    fontSize: '11px',
+    color: '#78350f',
+    margin: '2px 0',
+    fontFamily: 'monospace'
   },
   label: {
     fontSize: '12px',
@@ -362,9 +488,9 @@ const styles = {
     textAlign: 'center'
   },
   instructionText: {
-    fontSize: '14px',
+    fontSize: '13px',
     color: '#6b7280',
-    margin: '8px 0'
+    margin: '6px 0'
   }
 };
 
